@@ -13,13 +13,17 @@ import android.media.projection.MediaProjection;
 import android.media.projection.MediaProjectionManager;
 import android.os.Build;
 import android.os.IBinder;
+import android.provider.Settings;
 import android.util.Log;
+import android.view.WindowManager;
 
 import java.nio.ByteBuffer;
+import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicBoolean;
 
-public class CaptureService extends Service {
+public class CaptureService extends Service implements FrameAnalyzer.Listener {
     public static final String EXTRA_RESULT_CODE = "result_code";
     public static final String EXTRA_DATA = "projection_data";
     private static final String TAG = "VerbaCapture";
@@ -28,6 +32,9 @@ public class CaptureService extends Service {
     private ImageReader reader;
     private ExecutorService analysisExecutor;
     private FrameAnalyzer analyzer;
+    private OverlayView overlayView;
+    private WindowManager windowManager;
+    private final AtomicBoolean analysisBusy = new AtomicBoolean(false);
     private volatile long lastFrameAt = 0;
 
     private final MediaProjection.Callback projectionCallback = new MediaProjection.Callback() {
@@ -41,7 +48,7 @@ public class CaptureService extends Service {
         createNotificationChannel();
         Notification notification = new Notification.Builder(this, "capture")
             .setContentTitle("VERBA AIM LAB")
-            .setContentText("Захват и анализ кадров активны")
+            .setContentText("Анализ изображения и трекинг активны")
             .setSmallIcon(android.R.drawable.ic_menu_camera)
             .build();
         startForeground(42, notification);
@@ -63,9 +70,38 @@ public class CaptureService extends Service {
             projection = manager.getMediaProjection(result, data);
             projection.registerCallback(projectionCallback, null);
             analysisExecutor = Executors.newSingleThreadExecutor();
+            showOverlay();
             startCapture();
         }
         return START_NOT_STICKY;
+    }
+
+    private void showOverlay() {
+        if (!Settings.canDrawOverlays(this)) {
+            Log.w(TAG, "Overlay permission missing; detection continues without visual overlay");
+            return;
+        }
+        try {
+            windowManager = (WindowManager) getSystemService(WINDOW_SERVICE);
+            overlayView = new OverlayView(this);
+            int type = Build.VERSION.SDK_INT >= 26
+                ? WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+                : WindowManager.LayoutParams.TYPE_PHONE;
+            WindowManager.LayoutParams params = new WindowManager.LayoutParams(
+                WindowManager.LayoutParams.MATCH_PARENT,
+                WindowManager.LayoutParams.MATCH_PARENT,
+                type,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                    | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                    | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+                    | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                PixelFormat.TRANSLUCENT);
+            params.setTitle("VERBA AIM LAB visual telemetry");
+            windowManager.addView(overlayView, params);
+        } catch (Exception e) {
+            Log.e(TAG, "Cannot create visual overlay", e);
+            overlayView = null;
+        }
     }
 
     private void startCapture() {
@@ -80,22 +116,31 @@ public class CaptureService extends Service {
                 image = r.acquireLatestImage();
                 if (image == null) return;
                 long now = android.os.SystemClock.elapsedRealtime();
-                if (now - lastFrameAt < 250) return;
+                if (now - lastFrameAt < 250 || !analysisBusy.compareAndSet(false, true)) return;
                 lastFrameAt = now;
                 Bitmap frame = imageToBitmap(image);
-                if (frame != null && analysisExecutor != null) {
+                if (frame == null) {
+                    analysisBusy.set(false);
+                    return;
+                }
+                if (analysisExecutor != null) {
                     analysisExecutor.execute(() -> {
                         try {
-                            if (analyzer == null) analyzer = new FrameAnalyzer(getApplicationContext());
+                            if (analyzer == null) analyzer = new FrameAnalyzer(getApplicationContext(), this);
                             analyzer.analyze(frame);
                         } catch (Exception e) {
                             Log.e(TAG, "Cannot initialize frame analyzer", e);
                         } finally {
                             frame.recycle();
+                            analysisBusy.set(false);
                         }
                     });
+                } else {
+                    frame.recycle();
+                    analysisBusy.set(false);
                 }
             } catch (Exception e) {
+                analysisBusy.set(false);
                 Log.e(TAG, "Frame capture failed", e);
             } finally {
                 if (image != null) image.close();
@@ -103,7 +148,12 @@ public class CaptureService extends Service {
         }, null);
         display = projection.createVirtualDisplay("VerbaAimCapture", width, height, density,
             DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, reader.getSurface(), null, null);
-        Log.i(TAG, "Capture started " + width + "x" + height + "; analysis interval=250ms");
+        Log.i(TAG, "Capture started " + width + "x" + height + "; max analysis rate=4fps");
+    }
+
+    @Override public void onTargets(List<FrameAnalyzer.Target> targets, int frameWidth, int frameHeight) {
+        OverlayView view = overlayView;
+        if (view != null) view.updateTargets(targets, frameWidth, frameHeight);
     }
 
     private Bitmap imageToBitmap(Image image) {
@@ -148,12 +198,16 @@ public class CaptureService extends Service {
             projection.stop();
         }
         if (analysisExecutor != null) {
-            analysisExecutor.shutdown();
+            analysisExecutor.shutdownNow();
             analysisExecutor = null;
         }
         if (analyzer != null) {
             analyzer.close();
             analyzer = null;
+        }
+        if (overlayView != null && windowManager != null) {
+            try { windowManager.removeView(overlayView); } catch (Exception ignored) {}
+            overlayView = null;
         }
         super.onDestroy();
     }
