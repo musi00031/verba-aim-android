@@ -18,23 +18,66 @@ import com.google.mediapipe.tasks.components.containers.Category;
 import java.io.File;
 import java.io.FileWriter;
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Set;
 
-/** On-device frame analysis. It observes and records detections; it never sends game input. */
+/** Visible visual-analysis pipeline. It does not inject or synthesize game input. */
 public final class FrameAnalyzer implements AutoCloseable {
     private static final String TAG = "VerbaFrameAnalyzer";
+    private static final long TRACK_TTL_MS = 1200L;
     private final ObjectDetector detector;
     private final File csvFile;
+    private final Listener listener;
+    private final List<Track> tracks = new ArrayList<>();
     private long frameCount = 0;
-    private long startedAt = SystemClock.elapsedRealtime();
-    private long lastDetectionAt = 0;
-    private float previousCenterX = Float.NaN;
-    private float previousCenterY = Float.NaN;
-    private long previousTimestamp = 0;
-    private int trackedId = 0;
+    private final long startedAt = SystemClock.elapsedRealtime();
+    private int nextTrackId = 1;
 
-    public FrameAnalyzer(Context context) throws IOException {
+    public interface Listener {
+        void onTargets(List<Target> targets, int frameWidth, int frameHeight);
+    }
+
+    public static final class Target {
+        public final int id;
+        public final float left, top, right, bottom;
+        public final float aimX, aimY;
+        public final float confidence;
+        public final float velocityX, velocityY;
+
+        Target(int id, RectF box, float aimX, float aimY, float confidence,
+               float velocityX, float velocityY) {
+            this.id = id;
+            this.left = box.left;
+            this.top = box.top;
+            this.right = box.right;
+            this.bottom = box.bottom;
+            this.aimX = aimX;
+            this.aimY = aimY;
+            this.confidence = confidence;
+            this.velocityX = velocityX;
+            this.velocityY = velocityY;
+        }
+    }
+
+    private static final class Track {
+        int id;
+        RectF box;
+        long timestamp;
+        float vx, vy;
+        float confidence;
+        Track(int id, RectF box, long timestamp, float confidence) {
+            this.id = id;
+            this.box = new RectF(box);
+            this.timestamp = timestamp;
+            this.confidence = confidence;
+        }
+    }
+
+    public FrameAnalyzer(Context context, Listener listener) throws IOException {
+        this.listener = listener;
         BaseOptions base = BaseOptions.builder()
             .setModelAssetPath("efficientdet_lite0.tflite")
             .build();
@@ -42,82 +85,113 @@ public final class FrameAnalyzer implements AutoCloseable {
             ObjectDetector.ObjectDetectorOptions.builder()
                 .setBaseOptions(base)
                 .setRunningMode(RunningMode.IMAGE)
-                .setScoreThreshold(0.35f)
-                .setMaxResults(15)
+                .setScoreThreshold(0.30f)
+                .setMaxResults(20)
                 .build();
         detector = ObjectDetector.createFromOptions(context, options);
         File dir = new File(context.getExternalFilesDir(null), "reports");
         if (!dir.exists() && !dir.mkdirs()) throw new IOException("Cannot create reports directory");
-        csvFile = new File(dir, "verba_detection_" + System.currentTimeMillis() + ".csv");
-        try (FileWriter writer = new FileWriter(csvFile, true)) {
-            writer.write("elapsed_ms,frame,width,height,label,confidence,left,top,right,bottom,center_x,center_y,delta_x,delta_y,velocity_px_s\n");
+        csvFile = new File(dir, "verba_tracking_" + System.currentTimeMillis() + ".csv");
+        try (FileWriter writer = new FileWriter(csvFile, false)) {
+            writer.write("elapsed_ms,frame,track_id,label,confidence,left,top,right,bottom,center_x,center_y,aim_x,aim_y,velocity_x_px_s,velocity_y_px_s,frame_width,frame_height\n");
         }
-        Log.i(TAG, "Model loaded; report=" + csvFile.getAbsolutePath());
+        Log.i(TAG, "Detector ready; CSV=" + csvFile.getAbsolutePath());
     }
 
     public void analyze(Bitmap bitmap) {
-        if (bitmap == null || detector == null) return;
+        if (bitmap == null) return;
         long now = SystemClock.elapsedRealtime();
         frameCount++;
+        MPImage input = null;
         try {
-            MPImage input = new BitmapImageBuilder(bitmap).build();
+            input = new BitmapImageBuilder(bitmap).build();
             ObjectDetectorResult result = detector.detect(input);
             List<Detection> detections = result.detections();
-            boolean foundPerson = false;
+            Set<Integer> used = new HashSet<>();
+            List<Target> visible = new ArrayList<>();
+
             for (Detection detection : detections) {
                 List<Category> categories = detection.categories();
                 if (categories == null || categories.isEmpty()) continue;
                 Category category = categories.get(0);
                 String label = category.categoryName();
                 if (label == null || !label.equalsIgnoreCase("person")) continue;
-                foundPerson = true;
+
                 RectF box = detection.boundingBox();
-                float cx = box.centerX();
-                float cy = box.centerY();
-                float dx = cx - bitmap.getWidth() / 2f;
-                float dy = cy - bitmap.getHeight() / 2f;
-                float velocity = 0f;
-                if (!Float.isNaN(previousCenterX) && now > previousTimestamp) {
-                    float dt = (now - previousTimestamp) / 1000f;
-                    float distance = (float)Math.hypot(cx - previousCenterX, cy - previousCenterY);
-                    velocity = distance / Math.max(dt, 0.001f);
-                } else {
-                    trackedId++;
+                int bestIndex = -1;
+                float bestScore = 0.12f;
+                for (int i = 0; i < tracks.size(); i++) {
+                    Track candidate = tracks.get(i);
+                    if (used.contains(candidate.id)) continue;
+                    float score = associationScore(candidate.box, box);
+                    if (score > bestScore) {
+                        bestScore = score;
+                        bestIndex = i;
+                    }
                 }
-                previousCenterX = cx;
-                previousCenterY = cy;
-                previousTimestamp = now;
-                lastDetectionAt = now;
-                appendRow(now - startedAt, bitmap, label, category.score(), box, cx, cy, dx, dy, velocity);
-                Log.d(TAG, String.format(Locale.US,
-                    "PERSON id=%d conf=%.2f center=(%.0f,%.0f) offset=(%.0f,%.0f) velocity=%.1fpx/s",
-                    trackedId, category.score(), cx, cy, dx, dy, velocity));
+
+                Track track;
+                if (bestIndex >= 0) {
+                    track = tracks.get(bestIndex);
+                    float dt = Math.max(0.001f, (now - track.timestamp) / 1000f);
+                    float oldCx = track.box.centerX();
+                    float oldCy = track.box.centerY();
+                    float newCx = box.centerX();
+                    float newCy = box.centerY();
+                    track.vx = (newCx - oldCx) / dt;
+                    track.vy = (newCy - oldCy) / dt;
+                    track.box.set(box);
+                    track.timestamp = now;
+                    track.confidence = category.score();
+                } else {
+                    track = new Track(nextTrackId++, box, now, category.score());
+                    tracks.add(track);
+                }
+                used.add(track.id);
+
+                float aimX = box.centerX();
+                float aimY = box.top + box.height() * 0.16f;
+                Target target = new Target(track.id, box, aimX, aimY, category.score(), track.vx, track.vy);
+                visible.add(target);
+                appendRow(now - startedAt, bitmap, target);
             }
-            if (!foundPerson && now - lastDetectionAt > 1500) {
-                previousCenterX = Float.NaN;
-                previousCenterY = Float.NaN;
-                previousTimestamp = 0;
-            }
+
+            tracks.removeIf(t -> now - t.timestamp > TRACK_TTL_MS);
+            if (listener != null) listener.onTargets(visible, bitmap.getWidth(), bitmap.getHeight());
+
             if (frameCount % 30 == 0) {
                 float fps = frameCount * 1000f / Math.max(1, now - startedAt);
-                Log.i(TAG, String.format(Locale.US, "ANALYSIS frames=%d fps=%.1f detections=%d",
-                    frameCount, fps, detections.size()));
+                Log.i(TAG, String.format(Locale.US,
+                    "ANALYSIS frames=%d fps=%.1f persons=%d tracks=%d",
+                    frameCount, fps, visible.size(), tracks.size()));
             }
-            input.close();
         } catch (Exception e) {
             Log.e(TAG, "Frame inference failed", e);
+        } finally {
+            if (input != null) input.close();
         }
     }
 
-    private void appendRow(long elapsed, Bitmap bitmap, String label, float confidence,
-                           RectF box, float cx, float cy, float dx, float dy, float velocity) {
+    private float associationScore(RectF a, RectF b) {
+        float intersection = Math.max(0f, Math.min(a.right, b.right) - Math.max(a.left, b.left))
+            * Math.max(0f, Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top));
+        float union = a.width() * a.height() + b.width() * b.height() - intersection;
+        float iou = union > 0f ? intersection / union : 0f;
+        float distance = (float)Math.hypot(a.centerX() - b.centerX(), a.centerY() - b.centerY());
+        float scale = Math.max(1f, (float)Math.hypot(a.width(), a.height()));
+        float proximity = Math.max(0f, 1f - distance / (scale * 2.2f));
+        return Math.max(iou, proximity * 0.45f);
+    }
+
+    private void appendRow(long elapsed, Bitmap bitmap, Target t) {
         try (FileWriter writer = new FileWriter(csvFile, true)) {
             writer.write(String.format(Locale.US,
-                "%d,%d,%d,%d,%s,%.4f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.2f\n",
-                elapsed, frameCount, bitmap.getWidth(), bitmap.getHeight(), label, confidence,
-                box.left, box.top, box.right, box.bottom, cx, cy, dx, dy, velocity));
+                "%d,%d,%d,person,%.4f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.2f,%.2f,%d,%d\n",
+                elapsed, frameCount, t.id, t.confidence, t.left, t.top, t.right, t.bottom,
+                (t.left + t.right) / 2f, (t.top + t.bottom) / 2f, t.aimX, t.aimY,
+                t.velocityX, t.velocityY, bitmap.getWidth(), bitmap.getHeight()));
         } catch (IOException e) {
-            Log.e(TAG, "Cannot write detection report", e);
+            Log.e(TAG, "Cannot write tracking report", e);
         }
     }
 
