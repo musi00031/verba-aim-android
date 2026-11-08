@@ -17,6 +17,10 @@ public class CaptureService extends Service {
     private VirtualDisplay display;
     private ImageReader reader;
 
+    private final MediaProjection.Callback projectionCallback = new MediaProjection.Callback() {
+        @Override public void onStop() { stopSelf(); }
+    };
+
     @Override public int onStartCommand(Intent intent, int flags, int startId) {
         createNotificationChannel();
         Notification notification = new Notification.Builder(this, "capture")
@@ -25,12 +29,12 @@ public class CaptureService extends Service {
             .setSmallIcon(android.R.drawable.ic_menu_camera)
             .build();
         startForeground(42, notification);
-
         if (intent != null && intent.hasExtra(EXTRA_DATA)) {
             int result = intent.getIntExtra(EXTRA_RESULT_CODE, Activity.RESULT_CANCELED);
             Intent data = intent.getParcelableExtra(EXTRA_DATA);
             MediaProjectionManager manager = (MediaProjectionManager) getSystemService(MEDIA_PROJECTION_SERVICE);
             projection = manager.getMediaProjection(result, data);
+            projection.registerCallback(projectionCallback, null);
             startCapture();
         }
         return START_NOT_STICKY;
@@ -38,14 +42,12 @@ public class CaptureService extends Service {
 
     private void startCapture() {
         android.util.DisplayMetrics metrics = getResources().getDisplayMetrics();
-        int width = metrics.widthPixels;
-        int height = metrics.heightPixels;
-        int density = metrics.densityDpi;
+        int width = metrics.widthPixels, height = metrics.heightPixels, density = metrics.densityDpi;
         reader = ImageReader.newInstance(width, height, android.graphics.PixelFormat.RGBA_8888, 2);
         reader.setOnImageAvailableListener(r -> {
             android.media.Image image = r.acquireLatestImage();
             if (image != null) {
-                // Frame pipeline entry point. Pixel analysis is added in the next milestone.
+                // Frame-analysis pipeline entry point. No game input is synthesized.
                 image.close();
             }
         }, null);
@@ -63,7 +65,10 @@ public class CaptureService extends Service {
     @Override public void onDestroy() {
         if (display != null) display.release();
         if (reader != null) reader.close();
-        if (projection != null) projection.stop();
+        if (projection != null) {
+            projection.unregisterCallback(projectionCallback);
+            projection.stop();
+        }
         super.onDestroy();
     }
     @Override public IBinder onBind(Intent intent) { return null; }
